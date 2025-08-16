@@ -1,4 +1,4 @@
-name: Deploy to Windows VPS (WinRM)
+name: Deploy to Windows VPS (FTP)
 
 on:
   push:
@@ -91,80 +91,96 @@ jobs:
         '@
         $installScript | Out-File -FilePath .\deploy\install.ps1 -Encoding ascii
 
-    - name: Create deployment archive
-      run: |
-        Compress-Archive -Path .\deploy\* -DestinationPath deploy-package.zip -Force
+        # Create remote execution script
+        $remoteScript = @'
+        # Stop existing processes
+        Get-Process | Where-Object {$_.ProcessName -eq "python"} | Stop-Process -Force -ErrorAction SilentlyContinue
+        
+        # Run installation
+        Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+        & "C:\inetpub\wwwroot\CarPricePrediction\install.ps1"
+        
+        # Start application
+        Start-Process -FilePath "cmd.exe" -ArgumentList "/c C:\inetpub\wwwroot\CarPricePrediction\start_web.bat" -WindowStyle Hidden -WorkingDirectory "C:\inetpub\wwwroot\CarPricePrediction"
+        
+        Write-Host "Application started successfully"
+        '@
+        $remoteScript | Out-File -FilePath .\deploy\deploy_remote.ps1 -Encoding ascii
 
-    - name: Deploy to Windows VPS via WinRM
+    - name: Deploy via FTP
+      run: |
+        # FTP deployment script
+        $ftpScript = @'
+        $ftpServer = "${{ secrets.VPS_HOST }}"
+        $ftpUsername = "${{ secrets.FTP_USERNAME }}"
+        $ftpPassword = "${{ secrets.FTP_PASSWORD }}"
+        $ftpPath = "/CarPricePrediction/"
+        
+        $files = Get-ChildItem -Path ".\deploy" -Recurse -File
+        
+        foreach ($file in $files) {
+          try {
+            $relativePath = $file.FullName.Replace((Get-Location).Path + "\deploy\", "").Replace("\", "/")
+            $ftpUri = "ftp://$ftpServer$ftpPath$relativePath"
+            
+            Write-Host "Uploading: $relativePath"
+            
+            $ftprequest = [System.Net.FtpWebRequest]::Create($ftpUri)
+            $ftprequest.Method = [System.Net.WebRequestMethods+Ftp]::UploadFile
+            $ftprequest.Credentials = New-Object System.Net.NetworkCredential($ftpUsername, $ftpPassword)
+            $ftprequest.UseBinary = $true
+            
+            $fileContent = [System.IO.File]::ReadAllBytes($file.FullName)
+            $ftprequest.ContentLength = $fileContent.Length
+            
+            $requestStream = $ftprequest.GetRequestStream()
+            $requestStream.Write($fileContent, 0, $fileContent.Length)
+            $requestStream.Close()
+            
+            $response = $ftprequest.GetResponse()
+            Write-Host "Uploaded successfully: $($response.StatusDescription)"
+            $response.Close()
+          }
+          catch {
+            Write-Error "Failed to upload $relativePath : $($_.Exception.Message)"
+          }
+        }
+        '@
+        
+        # Execute FTP script
+        Invoke-Expression $ftpScript
+
+    - name: Execute remote installation
       shell: powershell
       run: |
         try {
-          # Add VPS to TrustedHosts
-          Write-Host "Configuring TrustedHosts for: ${{ secrets.VPS_HOST }}"
-          Set-Item WSMan:\localhost\Client\TrustedHosts -Value "${{ secrets.VPS_HOST }}" -Force
-          
-          # Create secure credentials
+          # Create secure credentials for WinRM
           $securePassword = ConvertTo-SecureString "${{ secrets.VPS_PASSWORD }}" -AsPlainText -Force
           $credential = New-Object System.Management.Automation.PSCredential ("${{ secrets.VPS_USERNAME }}", $securePassword)
           
-          Write-Host "Connecting to VPS: ${{ secrets.VPS_HOST }}"
-          
-          # Create PowerShell session with proper configuration
+          # Create PowerShell session for remote execution
           $sessionOptions = New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck
-          $session = New-PSSession -ComputerName "${{ secrets.VPS_HOST }}" -Credential $credential -Port 5985 -UseSSL:$false -SessionOption $sessionOptions -Authentication Basic
+          $session = New-PSSession -ComputerName "${{ secrets.VPS_HOST }}" -Credential $credential -Port 5985 -UseSSL:$false -SessionOption $sessionOptions -ErrorAction Stop
           
-          Write-Host "Session created successfully"
-          
-          # Create temp directory on remote machine
+          # Execute deployment script on remote machine
           Invoke-Command -Session $session -ScriptBlock {
-            New-Item -ItemType Directory -Force -Path "C:\temp"
-            New-Item -ItemType Directory -Force -Path "C:\inetpub\wwwroot\CarPricePrediction"
+            Set-Location -Path "C:\inetpub\wwwroot\CarPricePrediction"
+            & ".\deploy_remote.ps1"
           }
           
-          Write-Host "Copying deployment package..."
-          # Copy deployment package
-          Copy-Item -Path ".\deploy-package.zip" -Destination "C:\temp\deploy-package.zip" -ToSession $session -Force
-          
-          Write-Host "Extracting and installing on remote machine..."
-          # Execute deployment on remote machine
-          Invoke-Command -Session $session -ScriptBlock {
-            try {
-              # Stop any existing processes
-              Get-Process | Where-Object {$_.ProcessName -eq "python"} | Stop-Process -Force -ErrorAction SilentlyContinue
-              
-              # Extract files
-              Expand-Archive -Path "C:\temp\deploy-package.zip" -DestinationPath "C:\inetpub\wwwroot\CarPricePrediction\" -Force
-              
-              # Run installation script
-              Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
-              & "C:\inetpub\wwwroot\CarPricePrediction\install.ps1"
-              
-              # Start the web application
-              Start-Process -FilePath "cmd.exe" -ArgumentList "/c C:\inetpub\wwwroot\CarPricePrediction\start_web.bat" -WindowStyle Hidden -WorkingDirectory "C:\inetpub\wwwroot\CarPricePrediction"
-              
-              Write-Host "Deployment completed successfully on remote machine"
-            }
-            catch {
-              Write-Error "Error during remote deployment: $($_.Exception.Message)"
-              throw
-            }
-          }
-          
-          Write-Host "Deployment completed successfully"
+          Write-Host "Remote deployment completed successfully"
         }
         catch {
-          Write-Error "Deployment failed: $($_.Exception.Message)"
-          throw
+          Write-Warning "Could not execute remote installation via WinRM: $($_.Exception.Message)"
+          Write-Host "Please manually run deploy_remote.ps1 on the server"
         }
         finally {
-          # Clean up session
           if ($session) {
             Remove-PSSession $session
           }
         }
 
     - name: Verify deployment
-      shell: powershell
       run: |
         try {
           Start-Sleep -Seconds 30
@@ -173,4 +189,5 @@ jobs:
         }
         catch {
           Write-Warning "Could not verify deployment: $($_.Exception.Message)"
+          Write-Host "Please check the application manually"
         }
