@@ -1,4 +1,4 @@
-name: Deploy to Windows VPS
+name: Deploy to Windows VPS (WinRM)
 
 on:
   push:
@@ -91,38 +91,82 @@ jobs:
         '@
         $installScript | Out-File -FilePath .\deploy\install.ps1 -Encoding ascii
 
-    - name: Upload deployment package
-      uses: actions/upload-artifact@v4
-      with:
-        name: deploy-package
-        path: deploy/
-        retention-days: 1
+    - name: Create deployment archive
+      run: |
+        Compress-Archive -Path .\deploy\* -DestinationPath deploy-package.zip -Force
 
-    - name: Deploy to Windows VPS
-      uses: appleboy/scp-action@master
-      with:
-        host: ${{ secrets.VPS_HOST }}
-        username: ${{ secrets.VPS_USERNAME }}
-        password: ${{ secrets.VPS_PASSWORD }}
-        port: 22
-        source: "deploy/*"
-        target: "C:\\inetpub\\wwwroot\\CarPricePrediction\\"
+    - name: Deploy to Windows VPS via WinRM
+      shell: powershell
+      run: |
+        try {
+          # Create secure credentials
+          $securePassword = ConvertTo-SecureString "${{ secrets.VPS_PASSWORD }}" -AsPlainText -Force
+          $credential = New-Object System.Management.Automation.PSCredential ("${{ secrets.VPS_USERNAME }}", $securePassword)
+          
+          Write-Host "Connecting to VPS: ${{ secrets.VPS_HOST }}"
+          
+          # Create PowerShell session
+          $sessionOptions = New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck
+          $session = New-PSSession -ComputerName "${{ secrets.VPS_HOST }}" -Credential $credential -Port 5985 -UseSSL:$false -SessionOption $sessionOptions
+          
+          Write-Host "Session created successfully"
+          
+          # Create temp directory on remote machine
+          Invoke-Command -Session $session -ScriptBlock {
+            New-Item -ItemType Directory -Force -Path "C:\temp"
+            New-Item -ItemType Directory -Force -Path "C:\inetpub\wwwroot\CarPricePrediction"
+          }
+          
+          Write-Host "Copying deployment package..."
+          # Copy deployment package
+          Copy-Item -Path ".\deploy-package.zip" -Destination "C:\temp\deploy-package.zip" -ToSession $session -Force
+          
+          Write-Host "Extracting and installing on remote machine..."
+          # Execute deployment on remote machine
+          Invoke-Command -Session $session -ScriptBlock {
+            try {
+              # Stop any existing processes
+              Get-Process | Where-Object {$_.ProcessName -eq "python"} | Stop-Process -Force -ErrorAction SilentlyContinue
+              
+              # Extract files
+              Expand-Archive -Path "C:\temp\deploy-package.zip" -DestinationPath "C:\inetpub\wwwroot\CarPricePrediction\" -Force
+              
+              # Run installation script
+              Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+              & "C:\inetpub\wwwroot\CarPricePrediction\install.ps1"
+              
+              # Start the web application
+              Start-Process -FilePath "cmd.exe" -ArgumentList "/c C:\inetpub\wwwroot\CarPricePrediction\start_web.bat" -WindowStyle Hidden -WorkingDirectory "C:\inetpub\wwwroot\CarPricePrediction"
+              
+              Write-Host "Deployment completed successfully on remote machine"
+            }
+            catch {
+              Write-Error "Error during remote deployment: $($_.Exception.Message)"
+              throw
+            }
+          }
+          
+          Write-Host "Deployment completed successfully"
+        }
+        catch {
+          Write-Error "Deployment failed: $($_.Exception.Message)"
+          throw
+        }
+        finally {
+          # Clean up session
+          if ($session) {
+            Remove-PSSession $session
+          }
+        }
 
-    - name: Install and configure on VPS
-      uses: appleboy/ssh-action@master
-      with:
-        host: ${{ secrets.VPS_HOST }}
-        username: ${{ secrets.VPS_USERNAME }}
-        password: ${{ secrets.VPS_PASSWORD }}
-        port: 22
-        script: |
-          # Run installation script
-          cd C:\inetpub\wwwroot\CarPricePrediction
-          powershell -ExecutionPolicy Bypass -File .\install.ps1
-          
-          # Start the web application
-          Start-Process -FilePath "cmd.exe" -ArgumentList "/c start_web.bat" -WindowStyle Hidden
-          Start-Service -Name $serviceName
-          
-          # Restart IIS
-          iisreset
+    - name: Verify deployment
+      shell: powershell
+      run: |
+        try {
+          Start-Sleep -Seconds 30
+          $response = Invoke-WebRequest -Uri "http://${{ secrets.VPS_HOST }}/" -TimeoutSec 30 -UseBasicParsing
+          Write-Host "Application is running successfully. Status: $($response.StatusCode)"
+        }
+        catch {
+          Write-Warning "Could not verify deployment: $($_.Exception.Message)"
+        }
