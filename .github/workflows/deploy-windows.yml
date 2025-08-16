@@ -1,193 +1,216 @@
-name: Deploy to Windows VPS (FTP)
+name: Deploy Python App to Windows VPS
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
-  deploy:
+  build:
     runs-on: windows-latest
-
+    outputs:
+      build-path: ${{ steps.set-output.outputs.build-path }}
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
-
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.9'
-
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements_windows.txt
-        pip install pywin32
-
-    - name: Create deployment package
-      run: |
-        # Create package directory
-        New-Item -ItemType Directory -Force -Path .\deploy
-        
-        # Copy required files
-        Copy-Item api.py .\deploy\
-        Copy-Item best_model_RandomForestRegressor.pkl .\deploy\
-        Copy-Item web.config .\deploy\
-        Copy-Item requirements_windows.txt .\deploy\
-        Copy-Item app_win_service.py .\deploy\
-        
-        # Create startup script
-        $startupScript = @'
-        @echo off
-        cd /d "%~dp0"
-        python -m waitress --port=5000 api:app
-        '@
-        $startupScript | Out-File -FilePath .\deploy\start_web.bat -Encoding ascii
-
-        # Create installation script
-        $installScript = @'
-        # Create necessary directories
-        New-Item -ItemType Directory -Force -Path C:\logs
-        
-        # Install Python if not exists
-        if (-not (Test-Path "C:\Python39\python.exe")) {
-            Write-Host "Installing Python..."
-            Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.9.13/python-3.9.13-amd64.exe" -OutFile "python-installer.exe"
-            Start-Process -FilePath ".\python-installer.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1" -Wait
-            Remove-Item "python-installer.exe"
-        }
-        
-        # Install required packages
-        & C:\Python39\python.exe -m pip install --upgrade pip
-        & C:\Python39\python.exe -m pip install -r C:\inetpub\wwwroot\CarPricePrediction\requirements_windows.txt
-        & C:\Python39\python.exe -m pip install waitress pywin32
-        
-        # Configure IIS
-        Import-Module WebAdministration
-        
-        # Create or update the website
-        $iisApp = Get-IISSite -Name "CarPricePrediction" -ErrorAction SilentlyContinue
-        
-        if (-not $iisApp) {
-            New-IISSite -Name "CarPricePrediction" `
-                       -PhysicalPath "C:\inetpub\wwwroot\CarPricePrediction" `
-                       -BindingInformation "*:80:" `
-                       -Force
-        } else {
-            Set-ItemProperty -Path "IIS:\Sites\CarPricePrediction" -Name physicalPath -Value "C:\inetpub\wwwroot\CarPricePrediction"
-        }
-        
-        # Set permissions
-        $acl = Get-Acl "C:\inetpub\wwwroot\CarPricePrediction"
-        $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule("IIS AppPool\DefaultAppPool", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
-        $acl.SetAccessRule($accessRule)
-        Set-Acl "C:\inetpub\wwwroot\CarPricePrediction" $acl
-        
-        # Restart IIS
-        iisreset
-        
-        Write-Host "Installation completed successfully!"
-        Write-Host "To start the application, run: start_web.bat"
-        '@
-        $installScript | Out-File -FilePath .\deploy\install.ps1 -Encoding ascii
-
-        # Create remote execution script
-        $remoteScript = @'
-        # Stop existing processes
-        Get-Process | Where-Object {$_.ProcessName -eq "python"} | Stop-Process -Force -ErrorAction SilentlyContinue
-        
-        # Run installation
-        Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
-        & "C:\inetpub\wwwroot\CarPricePrediction\install.ps1"
-        
-        # Start application
-        Start-Process -FilePath "cmd.exe" -ArgumentList "/c C:\inetpub\wwwroot\CarPricePrediction\start_web.bat" -WindowStyle Hidden -WorkingDirectory "C:\inetpub\wwwroot\CarPricePrediction"
-        
-        Write-Host "Application started successfully"
-        '@
-        $remoteScript | Out-File -FilePath .\deploy\deploy_remote.ps1 -Encoding ascii
-
-    - name: Deploy via FTP
-      run: |
-        # FTP deployment script
-        $ftpScript = @'
-        $ftpServer = "${{ secrets.VPS_HOST }}"
-        $ftpUsername = "${{ secrets.FTP_USERNAME }}"
-        $ftpPassword = "${{ secrets.FTP_PASSWORD }}"
-        $ftpPath = "/CarPricePrediction/"
-        
-        $files = Get-ChildItem -Path ".\deploy" -Recurse -File
-        
-        foreach ($file in $files) {
-          try {
-            $relativePath = $file.FullName.Replace((Get-Location).Path + "\deploy\", "").Replace("\", "/")
-            $ftpUri = "ftp://$ftpServer$ftpPath$relativePath"
-            
-            Write-Host "Uploading: $relativePath"
-            
-            $ftprequest = [System.Net.FtpWebRequest]::Create($ftpUri)
-            $ftprequest.Method = [System.Net.WebRequestMethods+Ftp]::UploadFile
-            $ftprequest.Credentials = New-Object System.Net.NetworkCredential($ftpUsername, $ftpPassword)
-            $ftprequest.UseBinary = $true
-            
-            $fileContent = [System.IO.File]::ReadAllBytes($file.FullName)
-            $ftprequest.ContentLength = $fileContent.Length
-            
-            $requestStream = $ftprequest.GetRequestStream()
-            $requestStream.Write($fileContent, 0, $fileContent.Length)
-            $requestStream.Close()
-            
-            $response = $ftprequest.GetResponse()
-            Write-Host "Uploaded successfully: $($response.StatusDescription)"
-            $response.Close()
-          }
-          catch {
-            Write-Error "Failed to upload $relativePath : $($_.Exception.Message)"
-          }
-        }
-        '@
-        
-        # Execute FTP script
-        Invoke-Expression $ftpScript
-
-    - name: Execute remote installation
-      shell: powershell
-      run: |
-        try {
-          # Create secure credentials for WinRM
-          $securePassword = ConvertTo-SecureString "${{ secrets.VPS_PASSWORD }}" -AsPlainText -Force
-          $credential = New-Object System.Management.Automation.PSCredential ("${{ secrets.VPS_USERNAME }}", $securePassword)
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      
+      - name: Clean previous builds
+        run: |
+          if (Test-Path "build") { Remove-Item -Recurse -Force build }
+          if (Test-Path "*.pyc") { Remove-Item -Force *.pyc }
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_windows.txt
+          pip install pywin32 waitress
+      
+      - name: Create build directory
+        run: |
+          New-Item -ItemType Directory -Force -Path build
+      
+      - name: Copy application files
+        run: |
+          # Copy main application files
+          Copy-Item api.py build/
+          Copy-Item best_model_RandomForestRegressor.pkl build/
+          Copy-Item requirements_windows.txt build/
+          Copy-Item app_win_service.py build/
           
-          # Create PowerShell session for remote execution
-          $sessionOptions = New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck
-          $session = New-PSSession -ComputerName "${{ secrets.VPS_HOST }}" -Credential $credential -Port 5985 -UseSSL:$false -SessionOption $sessionOptions -ErrorAction Stop
-          
-          # Execute deployment script on remote machine
-          Invoke-Command -Session $session -ScriptBlock {
-            Set-Location -Path "C:\inetpub\wwwroot\CarPricePrediction"
-            & ".\deploy_remote.ps1"
+          # Copy web.config if exists
+          if (Test-Path "web.config") {
+            Copy-Item web.config build/
           }
+      
+      - name: Create startup scripts
+        run: |
+          # Create startup batch file
+          $startupScript = @'
+          @echo off
+          echo Starting Car Price Prediction API...
+          cd /d "%~dp0"
+          python -m waitress --host=0.0.0.0 --port=5000 api:app
+          '@
+          $startupScript | Out-File -FilePath build/start_app.bat -Encoding ascii
           
-          Write-Host "Remote deployment completed successfully"
-        }
-        catch {
-          Write-Warning "Could not execute remote installation via WinRM: $($_.Exception.Message)"
-          Write-Host "Please manually run deploy_remote.ps1 on the server"
-        }
-        finally {
-          if ($session) {
-            Remove-PSSession $session
-          }
-        }
+          # Create installation script
+          $installScript = @'
+          @echo off
+          echo Installing Car Price Prediction API...
+          
+          REM Create logs directory
+          if not exist "C:\logs" mkdir "C:\logs"
+          
+          REM Stop existing Python processes
+          echo Stopping existing Python processes...
+          taskkill /f /im python.exe /t >nul 2>&1
+          
+          REM Install/Update Python packages
+          echo Installing Python packages...
+          python -m pip install --upgrade pip
+          pip install -r requirements_windows.txt
+          pip install waitress pywin32
+          
+          REM Set permissions
+          echo Setting permissions...
+          icacls "C:\inetpub\wwwroot\CarPricePrediction" /grant "IIS_IUSRS:(OI)(CI)F" /T
+          
+          echo Installation completed!
+          '@
+          $installScript | Out-File -FilePath build/install.bat -Encoding ascii
+          
+          # Create service management script
+          $serviceScript = @'
+          @echo off
+          set SERVICE_NAME=CarPricePredictionAPI
+          
+          if "%1"=="start" goto start
+          if "%1"=="stop" goto stop
+          if "%1"=="restart" goto restart
+          
+          echo Usage: service.bat [start|stop|restart]
+          goto end
+          
+          :start
+          echo Starting %SERVICE_NAME%...
+          start /b python -m waitress --host=0.0.0.0 --port=5000 api:app
+          echo Service started
+          goto end
+          
+          :stop
+          echo Stopping %SERVICE_NAME%...
+          taskkill /f /im python.exe /t >nul 2>&1
+          echo Service stopped
+          goto end
+          
+          :restart
+          call :stop
+          timeout /t 5 /nobreak >nul
+          call :start
+          goto end
+          
+          :end
+          '@
+          $serviceScript | Out-File -FilePath build/service.bat -Encoding ascii
+      
+      - name: Set output path
+        id: set-output
+        run: echo "build-path=build" >> $env:GITHUB_OUTPUT
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-app-build
+          path: build/
+          retention-days: 1
 
-    - name: Verify deployment
-      run: |
-        try {
-          Start-Sleep -Seconds 30
-          $response = Invoke-WebRequest -Uri "http://${{ secrets.VPS_HOST }}/" -TimeoutSec 30 -UseBasicParsing
-          Write-Host "Application is running successfully. Status: $($response.StatusCode)"
-        }
-        catch {
-          Write-Warning "Could not verify deployment: $($_.Exception.Message)"
-          Write-Host "Please check the application manually"
-        }
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-app-build
+          path: build
+      
+      - name: Display build contents
+        run: |
+          echo "Build contents:"
+          ls -la build/
+      
+      - name: Copy files to VPS via SCP
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          port: 22
+          source: "build/*"
+          target: "C:/inetpub/wwwroot/CarPricePrediction/"
+          strip_components: 1
+          timeout: 120s
+          command_timeout: 10m
+      
+      - name: Deploy and restart application
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          port: 22
+          timeout: 120s
+          command_timeout: 10m
+          script: |
+            echo "=== Starting deployment process ==="
+            
+            # Navigate to application directory
+            cd "C:\inetpub\wwwroot\CarPricePrediction"
+            
+            # Run installation script
+            echo "Running installation..."
+            call install.bat
+            
+            # Stop existing service
+            echo "Stopping existing application..."
+            call service.bat stop
+            
+            # Wait a moment
+            timeout /t 10 /nobreak >nul
+            
+            # Start application
+            echo "Starting application..."
+            call service.bat start
+            
+            # Restart IIS (if using IIS integration)
+            echo "Restarting IIS..."
+            iisreset
+            
+            echo "=== Deployment completed ==="
+      
+      - name: Verify deployment
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          port: 22
+          script: |
+            echo "Waiting for application to start..."
+            timeout /t 30 /nobreak >nul
+            
+            # Check if Python process is running
+            echo "Checking Python processes..."
+            tasklist | findstr python.exe
+            
+            # Try to ping the application
+            echo "Testing application endpoint..."
+            powershell -Command "try { $response = Invoke-WebRequest -Uri 'http://localhost:5000' -TimeoutSec 10 -UseBasicParsing; Write-Host 'Application Status:' $response.StatusCode } catch { Write-Host 'Application test failed:' $_.Exception.Message }"
+            
+            echo "Deployment verification completed"
