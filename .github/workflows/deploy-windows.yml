@@ -99,15 +99,19 @@ jobs:
       shell: powershell
       run: |
         try {
+          # Add VPS to TrustedHosts
+          Write-Host "Configuring TrustedHosts for: ${{ secrets.VPS_HOST }}"
+          Set-Item WSMan:\localhost\Client\TrustedHosts -Value "${{ secrets.VPS_HOST }}" -Force
+          
           # Create secure credentials
           $securePassword = ConvertTo-SecureString "${{ secrets.VPS_PASSWORD }}" -AsPlainText -Force
           $credential = New-Object System.Management.Automation.PSCredential ("${{ secrets.VPS_USERNAME }}", $securePassword)
           
           Write-Host "Connecting to VPS: ${{ secrets.VPS_HOST }}"
           
-          # Create PowerShell session
+          # Create PowerShell session with proper configuration
           $sessionOptions = New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck
-          $session = New-PSSession -ComputerName "${{ secrets.VPS_HOST }}" -Credential $credential -Port 5985 -UseSSL:$false -SessionOption $sessionOptions
+          $session = New-PSSession -ComputerName "${{ secrets.VPS_HOST }}" -Credential $credential -Port 5985 -UseSSL:$false -SessionOption $sessionOptions -Authentication Basic
           
           Write-Host "Session created successfully"
           
