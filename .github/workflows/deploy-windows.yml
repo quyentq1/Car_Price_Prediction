@@ -154,9 +154,6 @@ jobs:
           port: 22
           source: "build/*"
           target: "C:/inetpub/wwwroot/CarPricePrediction/"
-          strip_components: 1
-          timeout: 120s
-          command_timeout: 10m
       
       - name: Deploy and restart application
         uses: appleboy/ssh-action@master
