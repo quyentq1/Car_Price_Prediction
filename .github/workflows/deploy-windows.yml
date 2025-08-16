@@ -1,0 +1,118 @@
+name: Deploy to Windows VPS
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements_windows.txt
+        pip install pyinstaller
+
+    - name: Create executable
+      run: |
+        pyinstaller --onefile --name=car_price_prediction api.py
+        Copy-Item best_model_RandomForestRegressor.pkl .\dist\
+        Copy-Item web.config .\dist\
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: app-files
+        path: dist/
+
+    - name: Deploy to Windows VPS
+      uses: appleboy/scp-action@master
+      with:
+        host: ${{ secrets.VPS_HOST }}
+        username: ${{ secrets.VPS_USERNAME }}
+        password: ${{ secrets.VPS_PASSWORD }}
+        port: 22
+        source: "dist/*"
+        target: "C:\\inetpub\\wwwroot\\CarPricePrediction\\"
+
+    - name: Install and start Windows service
+      uses: appleboy/ssh-action@master
+      with:
+        host: ${{ secrets.VPS_HOST }}
+        username: ${{ secrets.VPS_USERNAME }}
+        password: ${{ secrets.VPS_PASSWORD }}
+        port: 22
+        script: |
+          # Create logs directory if it doesn't exist
+          New-Item -ItemType Directory -Force -Path C:\logs
+          
+          # Install Python if not installed
+          if (-not (Test-Path "C:\Python39\python.exe")) {
+              Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.9.13/python-3.9.13-amd64.exe" -OutFile "python-installer.exe"
+              Start-Process -FilePath ".\python-installer.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1" -Wait
+              Remove-Item "python-installer.exe"
+          }
+          
+          # Install required packages
+          & C:\Python39\python.exe -m pip install --upgrade pip
+          & C:\Python39\python.exe -m pip install -r C:\\inetpub\\wwwroot\\CarPricePrediction\\requirements_windows.txt
+          & C:\Python39\python.exe -m pip install pywin32
+          
+          # Install and start the service
+          $serviceName = "CarPricePredictionService"
+          $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+          
+          if ($service) {
+              # Stop and remove existing service
+              Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+              sc.exe delete $serviceName
+          }
+          
+          # Create new service
+          $pythonPath = "C:\Python39\python.exe"
+          $scriptPath = "C:\\inetpub\\wwwroot\\CarPricePrediction\\app_win_service.py"
+          $serviceDisplayName = "Car Price Prediction Service"
+          $serviceDescription = "Hosts the Car Price Prediction API"
+          
+          # Create the service
+          New-Service -Name $serviceName `
+                      -BinaryPathName "\"$pythonPath\" \"$scriptPath\"" `
+                      -DisplayName $serviceDisplayName `
+                      -Description $serviceDescription `
+                      -StartupType Automatic `
+                      -ErrorAction Stop
+          
+          # Configure IIS
+          Import-Module WebAdministration
+          
+          # Create or update the website
+          $iisApp = Get-IISSite -Name "CarPricePrediction" -ErrorAction SilentlyContinue
+          
+          if (-not $iisApp) {
+              New-IISSite -Name "CarPricePrediction" `
+                         -PhysicalPath "C:\\inetpub\\wwwroot\\CarPricePrediction" `
+                         -BindingInformation "*:80:" `
+                         -Force
+          } else {
+              Set-ItemProperty -Path "IIS:\Sites\CarPricePrediction" -Name physicalPath -Value "C:\\inetpub\\wwwroot\\CarPricePrediction"
+          }
+          
+          # Enable directory browsing
+          Set-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter "system.webServer/directoryBrowse" -Name "enabled" -Value "True"
+          
+          # Start the service
+          Start-Service -Name $serviceName
+          
+          # Restart IIS
+          iisreset
