@@ -13,6 +13,7 @@ import joblib
 import os
 import math
 from datetime import datetime
+from waitress import serve  # Import waitress
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -40,19 +41,10 @@ def load_model():
     return model
 
 def preprocess_input(data):
-    """
-    Preprocess input data to match the format expected by the model.
-    
-    Args:
-        data (dict): Input data from the API request
-        
-    Returns:
-        pd.DataFrame: Processed data in the correct format for prediction
-    """
+    """Preprocess input data to match the format expected by the model."""
     try:
         print("\nRaw input data:", data)
         
-        # Create a new dictionary with default values
         processed_data = {
             'year': int(data.get('year', 2018)),
             'transmission': str(data.get('transmission', 'Manual')),
@@ -65,21 +57,16 @@ def preprocess_input(data):
             'automaker': str(data.get('automaker', 'Unknown')).lower()
         }
         
-        # Create DataFrame from processed data
         df = pd.DataFrame([processed_data])
         
-        # Add car class based on automaker
         def get_car_class(automaker):
             luxury_brands = ['audi', 'bmw', 'merc', 'lexus']
             return 'luxury' if automaker in luxury_brands else 'standard'
         
         df['car_class'] = df['automaker'].apply(get_car_class)
-        
-        # Add log features with error handling
         df['ln_mileage'] = np.log1p(df['mileage'].fillna(0).astype(float))
         df['ln_mpg'] = np.log1p(df['mpg'].fillna(0).astype(float))
         
-        # Select and order features as expected by the model
         features = [
             'ln_mileage', 'tax', 'ln_mpg', 'transmission',
             'fuelType', 'automaker', 'car_class'
@@ -96,53 +83,29 @@ def preprocess_input(data):
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    """
-    Handle prediction requests.
-    
-    Expected JSON payload:
-    {
-        "year": 2018,
-        "transmission": "Automatic",
-        "mileage": 25000,
-        "fuelType": "Petrol",
-        "tax": 150,
-        "mpg": 45.6,
-        "engineSize": 1.5,
-        "model": "A4",
-        "automaker": "audi"
-    }
-    """
+    """Handle prediction requests."""
     try:
-        # Get JSON data from request
         data = request.get_json()
-        print("\nReceived data:", data)  # Debug log
+        print("\nReceived data:", data)
         
-        # Validate input
         if not data:
             return jsonify({"error": "No input data provided"}), 400
             
-        # Check required fields
         required_fields = ['year', 'transmission', 'mileage', 'fuelType', 'tax', 'mpg', 'engineSize', 'model', 'automaker']
         missing_fields = [field for field in required_fields if field not in data]
         if missing_fields:
             return jsonify({"error": f"Missing required fields: {', '.join(missing_fields)}"}), 400
             
-        # Preprocess input
         processed_data = preprocess_input(data)
-        print("\nProcessed data:", processed_data)  # Debug log
+        print("\nProcessed data:", processed_data)
         
-        # Make prediction
         model = load_model()
         prediction = model.predict(processed_data)
         
-        # Convert GBP to VND (1 GBP ≈ 30,000 VND)
         gbp_price = round(float(prediction[0]), 2)
         vnd_price = int(gbp_price * 30000)
-        
-        # Format VND with thousand separators
         formatted_vnd = "{:,}".format(vnd_price).replace(",", ".")
         
-        # Return prediction in both GBP and VND
         return jsonify({
             "predicted_price_gbp": gbp_price,
             "predicted_price_vnd": formatted_vnd,
@@ -172,7 +135,6 @@ def predict():
 def health_check():
     """Health check endpoint."""
     try:
-        # Try to load the model to check if it's available
         load_model()
         return jsonify({
             'status': 'healthy',
@@ -187,8 +149,7 @@ def health_check():
         }), 500
 
 if __name__ == '__main__':
-    # Create models directory if it doesn't exist
     os.makedirs('models', exist_ok=True)
     
-    # Run the Flask app
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    # Run the Flask app using Waitress
+    serve(app, host='localhost', port=5001)
