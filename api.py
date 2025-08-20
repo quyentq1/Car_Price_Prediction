@@ -1,38 +1,23 @@
-"""
-Car Price Prediction API
-
-This module provides a RESTful API for car price prediction using a pre-trained model.
-It's designed to be called from a React frontend.
-"""
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pandas as pd
 import numpy as np
 import joblib
 import os
-import math
+import re
 from datetime import datetime
-from waitress import serve  # Import waitress
 
-# Initialize Flask app
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app)
 
-# Load the pre-trained model
 MODEL_PATH = 'best_model_RandomForestRegressor.pkl'
-model = None
+VALID_VALUES_PATH = 'models/valid_values.pkl'
+DATA_PATH = 'data.csv'
 
-# Define valid values for categorical features
-VALID_TRANSMISSIONS = ['Automatic', 'Manual', 'Semi-Auto', 'Other']
-VALID_FUEL_TYPES = ['Diesel', 'Hybrid', 'Petrol', 'Other']
-VALID_MAKERS = [
-    'audi', 'bmw', 'focus', 'ford', 'hyundi', 
-    'merc', 'skoda', 'toyota', 'vauxhall', 'vw'
-]
+model, valid_values = None, None
 
+# ======================== LOAD MODEL & VALID VALUES ========================
 def load_model():
-    """Load the pre-trained model."""
     global model
     if model is None:
         if not os.path.exists(MODEL_PATH):
@@ -40,116 +25,131 @@ def load_model():
         model = joblib.load(MODEL_PATH)
     return model
 
-def preprocess_input(data):
-    """Preprocess input data to match the format expected by the model."""
-    try:
-        print("\nRaw input data:", data)
-        
-        processed_data = {
-            'year': int(data.get('year', 2018)),
-            'transmission': str(data.get('transmission', 'Manual')),
-            'mileage': float(data.get('mileage', 30000)),
-            'fuelType': str(data.get('fuelType', 'Petrol')),
-            'tax': float(data.get('tax', 145)),
-            'mpg': float(data.get('mpg', 50.0)),
-            'engineSize': float(data.get('engineSize', 1.6)),
-            'model': str(data.get('model', 'Unknown')),
-            'automaker': str(data.get('automaker', 'Unknown')).lower()
-        }
-        
-        df = pd.DataFrame([processed_data])
-        
-        def get_car_class(automaker):
-            luxury_brands = ['audi', 'bmw', 'merc', 'lexus']
-            return 'luxury' if automaker in luxury_brands else 'standard'
-        
-        df['car_class'] = df['automaker'].apply(get_car_class)
-        df['ln_mileage'] = np.log1p(df['mileage'].fillna(0).astype(float))
-        df['ln_mpg'] = np.log1p(df['mpg'].fillna(0).astype(float))
-        
-        features = [
-            'ln_mileage', 'tax', 'ln_mpg', 'transmission',
-            'fuelType', 'automaker', 'car_class'
-        ]
-        
-        print("\nProcessed features:", df[features].to_dict('records'))
-        return df[features]
-        
-    except Exception as e:
-        import traceback
-        print("\nError in preprocess_input:")
-        print(traceback.format_exc())
-        raise ValueError(f"Error processing input data: {str(e)}")
+def load_valid_values():
+    global valid_values
+    if valid_values is None:
+        if not os.path.exists(VALID_VALUES_PATH):
+            raise FileNotFoundError(f"Valid values file not found at {VALID_VALUES_PATH}")
+        valid_values = joblib.load(VALID_VALUES_PATH)
+    return valid_values
 
-@app.route('/predict', methods=['POST'])
+# ======================== PARSE HELPERS ========================
+def parse_price(price_str):
+    if pd.isna(price_str):
+        return np.nan
+    price_str = price_str.replace(' ', '').lower()
+    parts = re.findall(r'(\d+)(billionvnd|millionvnd)', price_str)
+    total_price = 0
+    for value, unit in parts:
+        value = int(value)
+        if unit == 'billionvnd':
+            total_price += value * 1_000_000_000
+        elif unit == 'millionvnd':
+            total_price += value * 1_000_000
+    return total_price
+
+def parse_mileage(mileage_str):
+    if pd.isna(mileage_str):
+        return np.nan
+    mileage_str = str(mileage_str).replace(',', '').replace('km', '').strip()
+    return int(mileage_str) if mileage_str.isdigit() else np.nan
+
+def parse_engine(engine_str):
+    """
+    Parses the engine string for fuel type and engine size.
+    This version works with English fuel types.
+    """
+    if pd.isna(engine_str):
+        return ('Unknown', np.nan)
+    engine_str = str(engine_str).lower()
+    
+    # Updated map for English fuel types
+    fuel_type_map = {
+        'petrol': 'Petrol', 
+        'diesel': 'Diesel', 
+        'electric': 'Electric', 
+        'hybrid': 'Hybrid'
+    }
+    
+    fuel_type = 'Unknown'
+    for key, value in fuel_type_map.items():
+        if key in engine_str:
+            fuel_type = value
+            break
+            
+    engine_size_match = re.search(r'(\d+\.\d+)', engine_str)
+    engine_size = float(engine_size_match.group(1)) if engine_size_match else np.nan
+    return (fuel_type, engine_size)
+
+def parse_name(name_str):
+    if pd.isna(name_str):
+        return ('Unknown', 'Unknown')
+    parts = str(name_str).split()
+    automaker = parts[0]
+    model = " ".join(parts[1:])
+    return (automaker, model)
+
+# ======================== API ENDPOINTS ========================
+@app.route('/api/predict', methods=['POST'])
 def predict():
-    """Handle prediction requests."""
     try:
-        data = request.get_json()
-        print("\nReceived data:", data)
+        load_model()
+        json_data = request.get_json()
         
-        if not data:
-            return jsonify({"error": "No input data provided"}), 400
-            
-        required_fields = ['year', 'transmission', 'mileage', 'fuelType', 'tax', 'mpg', 'engineSize', 'model', 'automaker']
-        missing_fields = [field for field in required_fields if field not in data]
-        if missing_fields:
-            return jsonify({"error": f"Missing required fields: {', '.join(missing_fields)}"}), 400
-            
-        processed_data = preprocess_input(data)
-        print("\nProcessed data:", processed_data)
+        df = pd.DataFrame(json_data, index=[0])
         
-        model = load_model()
-        prediction = model.predict(processed_data)
+        required_features = ['year', 'mileage', 'fuelType', 'engineSize', 'transmission', 'automaker', 'model', 'condition', 'origin', 'bodyStyle']
+        for col in required_features:
+            if col not in df.columns:
+                return jsonify({'error': f'Missing required feature: {col}', 'status': 'error'}), 400
+
+        prediction = model.predict(df)
         
-        gbp_price = round(float(prediction[0]), 2)
-        vnd_price = int(gbp_price * 30000)
-        formatted_vnd = "{:,}".format(vnd_price).replace(",", ".")
-        
-        return jsonify({
-            "predicted_price_gbp": gbp_price,
-            "predicted_price_vnd": formatted_vnd,
-            "currency": "VND",
-            "model_used": model.named_steps['regressor'].__class__.__name__,
-            "exchange_rate": "1 GBP = 30,000 VND",
-            "features": {
-                'year': data.get('year'),
-                'transmission': data.get('transmission'),
-                'mileage': data.get('mileage'),
-                'fuelType': data.get('fuelType'),
-                'tax': data.get('tax'),
-                'mpg': data.get('mpg'),
-                'engineSize': data.get('engineSize'),
-                'model': data.get('model'),
-                'automaker': data.get('automaker')
-            }
-        })
+        return jsonify({'status': 'success', 'prediction': prediction[0]})
         
     except Exception as e:
-        return jsonify({
-            'error': f'Prediction failed: {str(e)}',
-            'status': 'error'
-        }), 500
+        return jsonify({'error': str(e), 'status': 'error'}), 500
+
+@app.route('/api/get_unique_values', methods=['GET'])
+def get_unique_values():
+    try:
+        df = pd.read_csv(DATA_PATH)
+        df[['automaker', 'model']] = df['Name'].apply(lambda x: pd.Series(parse_name(x)))
+        df[['fuelType', 'engineSize']] = df['Engine'].apply(lambda x: pd.Series(parse_engine(x)))
+        
+        brands = sorted(df['automaker'].dropna().unique().tolist())
+        brand_models = {brand: sorted(df[df['automaker'] == brand]['model'].dropna().unique().tolist()) for brand in brands}
+        fuel_types = sorted(df['fuelType'].dropna().unique().tolist())
+        
+        return jsonify({'status': 'success','data': {'brands': brands,'brand_models': brand_models,'fuel_types': fuel_types}})
+    except Exception as e:
+        return jsonify({'error': str(e), 'status': 'error'}), 500
+
+@app.route('/api/get_models_by_brand/<brand>', methods=['GET'])
+def get_models_by_brand(brand):
+    try:
+        df = pd.read_csv(DATA_PATH)
+        df[['automaker','model']] = df['Name'].apply(lambda x: pd.Series(parse_name(x)))
+        models = sorted(df[df['automaker']==brand]['model'].dropna().unique().tolist())
+        return jsonify({'status': 'success','brand': brand,'models': models})
+    except Exception as e:
+        return jsonify({'error': str(e), 'status': 'error'}), 500
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """Health check endpoint."""
     try:
-        load_model()
-        return jsonify({
-            'status': 'healthy',
-            'message': 'API is running and model is loaded',
-            'timestamp': datetime.now().isoformat()
-        })
+        load_model(); load_valid_values()
+        return jsonify({'status': 'healthy','timestamp': datetime.now().isoformat()})
     except Exception as e:
-        return jsonify({
-            'status': 'unhealthy',
-            'error': str(e),
-            'timestamp': datetime.now().isoformat()
-        }), 500
+        return jsonify({'status': 'unhealthy','error': str(e)}), 500
+
+@app.route('/api/metadata', methods=['GET'])
+def get_metadata():
+    try:
+        valid = load_valid_values()
+        return jsonify({"required_features": ['year','mileage','fuelType','engineSize','transmission','automaker','model','condition','origin','bodyStyle'],"valid_values": valid})
+    except Exception as e:
+        return jsonify({'error': str(e), 'status': 'error'}), 500
 
 if __name__ == '__main__':
-    os.makedirs('models', exist_ok=True)
-    
-    # Run the Flask app using Waitress
-    serve(app, host='localhost', port=5001)
+    app.run(debug=True, port=5000)
